@@ -12,7 +12,7 @@ from django.utils import timezone
 from djblets.siteconfig.models import SiteConfiguration
 
 from reviewboard.reviews.models import ReviewRequest
-
+from reviewboard.reviews.models import Comment
 try:
     import lucene
     lucene.initVM(lucene.CLASSPATH)
@@ -27,6 +27,162 @@ except ImportError:
     # DEBUG = False)
     have_lucene = False
 
+def flatten_comment(comment):
+    text = comment.text
+    for reply in comment._replies:
+        text = text + "\n" + flatten_comment(reply)
+    return text 
+
+def get_all_review_comments(review_request):
+    """
+    Ripped from review_detail in views.py to get the inside track on extracting all comments from a review.
+    """
+
+    # The review request detail page needs a lot of data from the database,
+    # and going through standard model relations will result in far too many
+    # queries. So we'll be optimizing quite a bit by prefetching and
+    # re-associating data.
+    #
+    # We will start by getting the list of reviews. We'll filter this out into
+    # some other lists, build some ID maps, and later do further processing.
+    entries = []
+    public_reviews = []
+    body_top_replies = {}
+    body_bottom_replies = {}
+    replies = {}
+    reply_timestamps = {}
+    reviews_entry_map = {}
+    reviews_id_map = {}
+    review_timestamp = 0
+
+    # Start by going through all reviews that point to this review request.
+    # We'll be separating these into a list of public reviews and a mapping of replies.
+    #
+    all_reviews = list(review_request.reviews.select_related('user'))
+
+    for review in all_reviews:
+        review._body_top_replies = []
+        review._body_bottom_replies = []
+
+        if review.public:
+            # This is a review we'll display on the page. Keep track of it
+            # for later display and filtering.
+            public_reviews.append(review)
+            parent_id = review.base_reply_to_id
+
+            if parent_id is not None:
+                # This is a reply to a review. We'll store the reply data
+                # into a map, which associates a review ID with its list of
+                # replies, and also figures out the timestamps.
+                #
+                # Later, we'll use this to associate reviews and replies for
+                # rendering.
+                if parent_id not in replies:
+                    replies[parent_id] = [review]
+                    reply_timestamps[parent_id] = review.timestamp
+                else:
+                    replies[parent_id].append(review)
+                    reply_timestamps[parent_id] = max(
+                        reply_timestamps[parent_id],
+                        review.timestamp)
+
+        if review.public:
+            reviews_id_map[review.pk] = review
+
+            # If this review is replying to another review's body_top or
+            # body_bottom fields, store that data.
+            for reply_id, reply_list in (
+                (review.body_top_reply_to_id, body_top_replies),
+                (review.body_bottom_reply_to_id, body_bottom_replies)):
+                if reply_id is not None:
+                    if reply_id not in reply_list:
+                        reply_list[reply_id] = [review]
+                    else:
+                        reply_list[reply_id].append(review)
+
+    review_ids = reviews_id_map.keys()
+    last_visited = 0
+    starred = False
+
+    # Now that we have the list of public reviews and all that metadata,
+    # being processing them and adding entries for display in the page.
+    for review in public_reviews:
+        if not review.is_reply():
+            entry = {
+                'review': review,
+                'comments': {
+                    'diff_comments': [],
+                },
+                'timestamp': review.timestamp,
+            }
+            reviews_entry_map[review.pk] = entry
+            entries.append(entry)
+
+    # Link up all the review body replies.
+    for key, reply_list in (('_body_top_replies', body_top_replies),
+                            ('_body_bottom_replies', body_bottom_replies)):
+        for reply_id, replies in reply_list.iteritems():
+            setattr(reviews_id_map[reply_id], key, replies)
+
+    # Get all the comments and attach them to the reviews.
+    for model, key, ordering in (
+        (Comment, 'diff_comments',
+         ('comment__filediff', 'comment__first_line', 'comment__timestamp')),):
+        # Due to how we initially made the schema, we have a ManyToManyField
+        # inbetween comments and reviews, instead of comments having a
+        # ForeignKey to the review. This makes it difficult to easily go
+        # from a comment to a review ID.
+        #
+        # The solution to this is to not query the comment objects, but rather
+        # the through table. This will let us grab the review and comment in
+        # one go, using select_related.
+        related_field = model.review.related.field
+        comment_field_name = related_field.m2m_reverse_field_name()
+        through = related_field.rel.through
+        q = through.objects.filter(review__in=review_ids).select_related()
+
+        if ordering:
+            q = q.order_by(*ordering)
+
+        objs = list(q)
+
+        # Two passes. One to build a mapping, and one to actually process
+        # comments.
+        comment_map = {}
+
+        for obj in objs:
+            comment = getattr(obj, comment_field_name)
+            comment_map[comment.pk] = comment
+            comment._replies = []
+
+        for obj in objs:
+            comment = getattr(obj, comment_field_name)
+
+            # Short-circuit some object fetches for the comment by setting
+            # some internal state on them.
+            assert obj.review_id in reviews_id_map
+            parent_review = reviews_id_map[obj.review_id]
+            comment._review = parent_review
+            comment._review_request = review_request
+
+            if parent_review.is_reply():
+                # This is a reply to a comment. Add it to the list of replies.
+                assert obj.review_id not in reviews_entry_map
+                assert parent_review.base_reply_to_id in reviews_entry_map
+
+                # If there's an entry that isn't a reply, then it's
+                # orphaned. Ignore it.
+                if comment.is_reply():
+                    replied_comment = comment_map[comment.reply_to_id]
+                    replied_comment._replies.append(comment)
+            elif parent_review.public:
+                # This is a comment on a public review we're going to show.
+                # Add it to the list.
+                assert obj.review_id in reviews_entry_map
+                entry = reviews_entry_map[obj.review_id]
+                entry['comments'][key].append(comment)
+
+    return entries
 
 class Command(NoArgsCommand):
     option_list = NoArgsCommand.option_list + (
@@ -174,8 +330,20 @@ class Command(NoArgsCommand):
         doc.add(lucene.Field('username', request.submitter.username,
                              lucene.Field.Store.NO,
                              lucene_un_tokenized))
+				
+        comment_entries = get_all_review_comments(request)
+        comment_text = ""
+        for entry in comment_entries:
+            review = entry["review"]
+            comment_text = "\n".join([comment_text, review.body_top, review.body_bottom])
+            review_top_replies = "\n".join(map(lambda x: "\n".join([x.body_top, x.body_bottom]), review._body_top_replies))
+            review_bot_replies = "\n".join(map(lambda x: "\n".join([x.body_top, x.body_bottom]), review._body_bottom_replies))
+            comment_text = "\n".join([comment_text, review_top_replies, review_bot_replies])
+            comment_text += "\n".join(map(lambda x: flatten_comment(x), entry["comments"]["diff_comments"]))
+        doc.add(lucene.Field('comment', comment_text,
+                             lucene.Field.Store.NO,
+                             lucene_tokenized))
 
-        # FIXME: index reviews
         # FIXME: index dates
 
         files = []
@@ -201,6 +369,7 @@ class Command(NoArgsCommand):
                           request.testing_done,
                           bugs,
                           name,
+                          comment_text,
                           aggregate_files])
         doc.add(lucene.Field('text', text,
                              lucene.Field.Store.NO,
